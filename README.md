@@ -8,6 +8,8 @@ A Home Assistant custom integration for the **Alarm Manager rules** of UniFi Pro
 
 > **It changes rules on your Protect console.** Turning a switch off disables the rule in Protect; the card creates, edits and deletes real rules. It uses the same private API as the Protect app, which Ubiquiti doesn't document and can change in any Protect update.
 
+![The rules card: every Alarm Manager rule with its switch, hits in the last 24 hours and who it notifies](docs/images/rules-card.webp)
+
 ## Requirements
 
 - Home Assistant 2026.11 or newer.
