@@ -1,0 +1,27 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Protect Rules",
+        "description": "Adds, for every UniFi Protect Alarm Manager rule, an on/off switch, a 24-hour hit count, a last-fired time and an event that fires when the rule does. It uses the connection of the UniFi Protect integration, so there is nothing to fill in."
+      }
+    },
+    "abort": {
+      "already_configured": "Protect Rules is already set up",
+      "single_instance_allowed": "Protect Rules is already set up",
+      "protect_not_loaded": "Set up the UniFi Protect integration first",
+      "zones_not_installed": "Protect Zones isn't installed. Install it (it shares its connection to Protect with this integration), restart Home Assistant, then add Protect Rules again."
+    }
+  },
+  "services": {
+    "set_cooldown": {
+      "name": "Set rule cooldown",
+      "description": "Make Protect rules stay quiet for a while after they fire (good for noisy rules like Motion). Admin users only.",
+      "fields": {
+        "entity_id": { "name": "Rules", "description": "Protect Rules switches to change." },
+        "enabled": { "name": "Cooldown on", "description": "Turn the cooldown on or off." },
+        "minutes": { "name": "Minutes", "description": "How long the rule stays quiet after firing." }
+      }
+    }
+  }
+}

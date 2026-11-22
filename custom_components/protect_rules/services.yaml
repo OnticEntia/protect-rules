@@ -1,0 +1,22 @@
+set_cooldown:
+  fields:
+    entity_id:
+      required: true
+      selector:
+        entity:
+          integration: protect_rules
+          domain: switch
+          multiple: true
+    enabled:
+      required: true
+      default: true
+      selector:
+        boolean:
+    minutes:
+      default: 10
+      selector:
+        number:
+          min: 0.5
+          max: 1440
+          step: 0.5
+          unit_of_measurement: min
