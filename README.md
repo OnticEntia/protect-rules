@@ -48,6 +48,15 @@ One service device, **Protect Alarm Manager**, with these entities for each rule
 
 Rules added in Protect appear by themselves. A rule deleted in Protect loses its entities after it has been missing from a few readings in a row (about a minute and a half). Renaming a rule renames its entities' display names; entity ids stay as they are.
 
+### Cameras that go offline or are removed
+
+- **Offline** (still in Protect): rules keep working as Protect has them. The card marks the device "(offline)"; it can still be picked.
+- **Removed from Protect**: a rule can go on naming a device Protect no longer has. The rule and its entities stay. The device is shown as "<its name> (removed)", or "Removed device" if it was never seen by this integration, and the switch lists it under the `removed_devices` attribute. The card won't save a rule's devices or actions while they still name a removed device: open **Edit**, click the removed device to take it out, and save.
+- If Protect itself deletes a rule when its camera goes, the rule's entities are removed like those of any deleted rule.
+- A **newly adopted** camera shows up in the card within about half a minute. No restart is needed.
+
+The switch's `devices`, `removed_devices` and `offline_devices` attributes list the devices a rule names, by name.
+
 ### Using a rule as an automation trigger
 
 Use the rule's **fired** event entity as a state trigger. Its state is the time it last fired, so every firing is a state change.
@@ -86,6 +95,8 @@ Only Home Assistant **admin** users can use the card. Some things are still set 
 - **The card says "Custom element doesn't exist"**: restart Home Assistant after installing, then reload the browser page (clear the cache if needed).
 - **The card says only admin users can see the rules**: sign in as an admin.
 - **"This rule was changed somewhere else since you opened it"** when saving: the rule was changed in Protect or another browser while the form was open. Cancel and edit it again.
+- **"… was removed from Protect"** when saving: the rule still names a device Protect no longer has. In the edit form, click the device marked as removed (or pick another one in the action), then save.
+- **A warning that Protect isn't answering**: the console was briefly unreachable (a restart, an update). The rules are kept as they were and it recovers by itself; entities only go unavailable if it lasts more than a couple of minutes.
 - **No thumbnails or playback in a rule's recent firings**: those need Protect Detections.
 - **Something stopped working after a Protect update**: the private API may have changed. Please open an issue with the Protect version and the Home Assistant log lines for `custom_components.protect_rules`.
 

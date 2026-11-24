@@ -129,3 +129,166 @@ def fingerprint(rule: dict[str, Any]) -> str:
     if isinstance(core["cooldown"], dict):
         core["cooldown"] = {k: v for k, v in core["cooldown"].items() if k != "lastExecutedAt"}
     return hashlib.sha1(json.dumps(core, sort_keys=True, default=str).encode()).hexdigest()[:16]
+
+
+# ---------------------------------------------------------------- devices
+# A rule names devices by MAC (its scope, a light to turn on, a PTZ camera).
+# A device can be offline (still in Protect) or removed (no longer in
+# Protect); a rule can go on naming a removed one.
+
+REMOVED_NAME = "Removed device"
+REMEMBER_MAX = 500  # names of devices seen, kept so a removed one can still be named
+
+
+def rule_devices(rule: dict[str, Any]) -> list[str]:
+    """Every device (MAC) a rule names, in order, once each."""
+    out: list[str] = []
+
+    def add(mac: Any) -> None:
+        if isinstance(mac, str) and mac and mac not in out:
+            out.append(mac)
+
+    for src in rule.get("sources") or []:
+        if isinstance(src, dict):
+            add(src.get("device"))
+    for action in rule.get("actions") or []:
+        meta = action.get("metadata") if isinstance(action, dict) else None
+        if not isinstance(meta, dict):
+            continue
+        add(meta.get("target"))
+        for src in meta.get("sources") or []:
+            if isinstance(src, dict):
+                add(src.get("device"))
+    return out
+
+
+class Devices:
+    """What Protect has right now, plus the names of devices seen before.
+
+    names: {mac: name} of the devices in Protect; ids: {protect id: mac};
+    offline: MACs in Protect but not connected. known is False when the
+    device list couldn't be read (or came back empty): then nothing is
+    called removed, since we can't tell.
+    remembered: {mac or protect id: name} of every device seen, so one that
+    is removed later can still be named.
+    """
+
+    def __init__(self, remembered: dict[str, str] | None = None) -> None:
+        self.names: dict[str, str] = {}
+        self.ids: dict[str, str] = {}
+        self.offline: set[str] = set()
+        self.known = False
+        self.remembered: dict[str, str] = dict(remembered or {})
+
+    def update(self, devices: list[tuple[str, str, str, bool]] | None) -> tuple[bool, bool]:
+        """Take the current device list: (mac, protect id, name, connected)
+        each, or None if it couldn't be read. Returns (the set of devices
+        changed, a name to remember changed)."""
+        if not devices:
+            self.known = False
+            return False, False
+        names = {mac: name or mac for mac, _, name, _ in devices if mac}
+        changed = self.known and set(names) != set(self.names)
+        self.names = names
+        self.ids = {dev_id: mac for mac, dev_id, _, _ in devices if mac and dev_id}
+        self.offline = {mac for mac, _, _, connected in devices if mac and not connected}
+        self.known = True
+        learned = False
+        for mac, dev_id, name, _ in devices:
+            for key in (mac, dev_id):
+                if key and name and self.remembered.get(key) != name:
+                    self.remembered.pop(key, None)  # re-added below: newest last
+                    self.remembered[key] = name
+                    learned = True
+        while len(self.remembered) > REMEMBER_MAX:
+            self.remembered.pop(next(iter(self.remembered)))
+        return changed, learned
+
+    def is_removed(self, mac: str) -> bool:
+        return self.known and mac not in self.names
+
+    def label(self, mac: str | None) -> str | None:
+        """A name for a device a rule names: its name, "<name> (removed)",
+        or "Removed device" when it was never seen. Never blank or an id,
+        unless the device list is unknown and so is the device."""
+        if not mac:
+            return None
+        if mac in self.names:
+            return self.names[mac]
+        if not self.known:
+            return self.remembered.get(mac) or mac
+        return f"{self.remembered[mac]} (removed)" if mac in self.remembered else REMOVED_NAME
+
+    def label_by_id(self, dev_id: str | None) -> str | None:
+        """The same for a Protect device id (what a rule's history uses)."""
+        if not dev_id:
+            return None
+        if dev_id in self.ids:
+            return self.names.get(self.ids[dev_id])
+        if not self.known:
+            return self.remembered.get(dev_id)
+        return f"{self.remembered[dev_id]} (removed)" if dev_id in self.remembered else REMOVED_NAME
+
+    def removed_in(self, rules: dict[str, dict[str, Any]]) -> dict[str, str | None]:
+        """{mac: last known name or None} of removed devices the rules name."""
+        if not self.known:
+            return {}
+        return {
+            mac: self.remembered.get(mac)
+            for rule in rules.values()
+            for mac in rule_devices(rule)
+            if mac not in self.names
+        }
+
+    def check(self, macs: Any) -> None:
+        """Refuse (ValueError, with a message for the user) to send Protect a
+        device it no longer has."""
+        if not self.known:
+            return
+        gone = [mac for mac in dict.fromkeys(macs or []) if mac not in self.names]
+        if not gone:
+            return
+        names = ", ".join(self.remembered.get(mac) or "a device" for mac in gone)
+        raise ValueError(
+            f"{names} {'was' if len(gone) == 1 else 'were'} removed from Protect. "
+            "Take it out of the rule (its devices and actions), then save again."
+        )
+
+
+def rule_device_summary(rule: dict[str, Any], devices: Devices) -> dict[str, Any]:
+    """For a rule's entity attributes: the devices it names, by name, and
+    which of those are gone or offline. Always lists of strings."""
+    macs = rule_devices(rule)
+    return {
+        "devices": [devices.label(mac) or REMOVED_NAME for mac in macs],
+        "removed_devices": [devices.label(mac) or REMOVED_NAME for mac in macs if devices.is_removed(mac)],
+        "offline_devices": [devices.names[mac] for mac in macs if mac in devices.offline and mac in devices.names],
+    }
+
+
+# ----------------------------------------------------------------- outages
+
+OUTAGE_GRACE = 3  # failed reads in a row that are ridden out with the last known rules
+
+
+class Outage:
+    """How to treat a failed read of the rules. A short outage (the console
+    restarting, a timeout) is ridden out: the first failure is worth one
+    warning, the next ones nothing, and the rules stay as they were. Only
+    when it lasts is it reported as a failure (entities go unavailable)."""
+
+    def __init__(self, grace: int = OUTAGE_GRACE) -> None:
+        self.grace = grace
+        self.failures = 0
+
+    def failed(self, have_data: bool) -> str:
+        """"warn", "quiet" (keep the last rules) or "fail" (give up for now)."""
+        self.failures += 1
+        if not have_data or self.failures > self.grace:
+            return "fail"
+        return "warn" if self.failures == 1 else "quiet"
+
+    def succeeded(self) -> int:
+        """Failed reads this success ends (0 if there was no outage)."""
+        failures, self.failures = self.failures, 0
+        return failures

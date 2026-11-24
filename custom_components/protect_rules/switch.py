@@ -10,6 +10,7 @@ from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
 from . import ProtectRulesConfigEntry
 from .entity import RuleEntity, add_new_rules, describe
+from .logic import rule_device_summary
 
 
 async def async_setup_entry(
@@ -44,7 +45,11 @@ class RuleSwitch(RuleEntity, SwitchEntity):
 
     @property
     def extra_state_attributes(self) -> dict[str, Any] | None:
-        return describe(self.rule) if self.rule else None
+        if not self.rule:
+            return None
+        # the devices the rule names, by name; one removed from Protect is
+        # listed as removed rather than left out or shown as an id
+        return {**describe(self.rule), **rule_device_summary(self.rule, self.coordinator.devices)}
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         await self.coordinator.async_edit(self.rule_id, lambda rule: {"enable": True})

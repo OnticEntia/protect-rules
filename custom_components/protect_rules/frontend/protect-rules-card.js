@@ -389,6 +389,8 @@ const DLG_STYLE = `
     display: inline-flex; gap: 6px; align-items: center; }
   .pick button ha-icon { --mdc-icon-size: 16px; }
   .pick button[disabled], .tab[disabled] { opacity: .3; cursor: not-allowed; }
+  .pick button.gone { border-style: dashed; color: #fca5a5; }
+  .k.warn, .body .k.warn { color: #fca5a5; }
   .pick button.on { color: #fff; border-color: var(--primary-color, #e0102a); background: color-mix(in srgb, var(--primary-color, #e0102a) 30%, transparent); }
   [hidden] { display: none !important; }
   .mono { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; overflow-wrap: anywhere; user-select: all; margin-bottom: 6px; }
@@ -469,6 +471,21 @@ class ProtectRulesCard extends HTMLElement {
     this._unsub = null;
   }
 
+  // A device's name. One that was removed from Protect but is still named by
+  // a rule is "<its name> (removed)", never blank or an id.
+  _dev(mac) {
+    return this._devices[mac] || (this._labels || {})[mac] || (this._gone(mac) ? "Removed device" : mac);
+  }
+
+  _gone(mac) {
+    return !!this._removed && mac in this._removed;
+  }
+
+  // for pickers: an offline device is still in Protect and can be picked
+  _pickName(mac) {
+    return `${this._dev(mac)}${this._offline && this._offline.has(mac) ? " (offline)" : ""}`;
+  }
+
   _save() {
     try {
       localStorage.setItem(OPTS_KEY, JSON.stringify(this._opts));
@@ -488,7 +505,10 @@ class ProtectRulesCard extends HTMLElement {
         this._unloaded = false;
         this._rules = data.rules || [];
         this._revs = data.revs || {}; // rule id -> what it looked like, sent back with an edit
-        this._devices = data.devices || {};
+        this._devices = data.devices || {}; // the devices Protect has now: { mac: name }
+        this._labels = data.labels || {}; // a name for every device a rule names, also a removed one
+        this._removed = data.removed || {}; // devices rules name that Protect no longer has
+        this._offline = new Set(data.offline || []); // in Protect, but not connected
         this._zones = data.zones || {};
         this._ptz = data.ptz || {}; // PTZ cameras: { mac: { presets, patrols } }
         this._people = { faces: [], vehicles: [], users: [], ...(data.people || {}) }; // named faces / vehicles, geofence users
@@ -582,7 +602,7 @@ class ProtectRulesCard extends HTMLElement {
       push: ch.includes("push"),
       email: ch.includes("email"),
       cool: cd.enable ? (cd.timeout || 0) / 60000 : 0,
-      scope: srcs.length ? `${srcs[0].type === "exclude" ? "All except " : ""}${srcs.map((s) => this._devices[s.device] || s.device).join(", ")}` : category(rule) === "system" || category(rule) === "other" ? "System" : "All devices",
+      scope: srcs.length ? `${srcs[0].type === "exclude" ? "All except " : ""}${srcs.map((s) => this._dev(s.device)).join(", ")}` : category(rule) === "system" || category(rule) === "other" ? "System" : "All devices",
     };
   }
 
@@ -861,7 +881,7 @@ class ProtectRulesCard extends HTMLElement {
     this._detailLater = false;
     this._detailShown = rule.id;
 
-    const dev = (mac) => esc(this._devices[mac] || mac);
+    const dev = (mac) => esc(this._dev(mac));
     // the name, for a condition narrowed to one face / vehicle / person
     const who = (c) => {
       if (c.value == null || /^speed_/.test(c.source || "") || c.source === "webhook") return "";
@@ -900,7 +920,8 @@ class ProtectRulesCard extends HTMLElement {
             const parts = [["zone", "Zone"], ["line", "Line"], ["loiter", "Loiter zone"], ["package", "Package zone"]]
               .filter(([k]) => (z[k] || []).length)
               .map(([k, l]) => `${l}${z[k].length > 1 ? "s" : ""}: ${z[k].map((id) => esc(named(k, id)?.name || `#${id}`)).join(", ")}`);
-            return `<div class="item"><ha-icon icon="${s.type === "exclude" ? "mdi:cctv-off" : "mdi:cctv"}"></ha-icon><span class="grow">${dev(s.device)}<div class="k">${s.type === "exclude" ? "Excluded" : parts.join(" · ") || "Whole view"}</div></span></div>`;
+            const state = this._gone(s.device) ? '<div class="k warn">No longer in Protect. Edit the rule to take it out.</div>' : this._offline.has(s.device) ? '<div class="k">Offline</div>' : "";
+            return `<div class="item"><ha-icon icon="${this._gone(s.device) ? "mdi:alert-outline" : s.type === "exclude" ? "mdi:cctv-off" : "mdi:cctv"}"></ha-icon><span class="grow">${dev(s.device)}<div class="k">${s.type === "exclude" ? "Excluded" : parts.join(" · ") || "Whole view"}</div>${state}</span></div>`;
           })
           .join("")
       : `<div class="item"><ha-icon icon="mdi:check-all"></ha-icon><span class="grow">${i.scope === "System" ? "Works at the system level, not tied to a device" : "All devices"}</span></div>`;
@@ -1124,7 +1145,9 @@ class ProtectRulesCard extends HTMLElement {
     root.querySelector(".sub").textContent = n.id ? "Saved to UniFi Protect's Alarm Manager" : "Created in UniFi Protect's Alarm Manager";
     root.querySelector(".enable").hidden = true;
 
-    const devs = Object.entries(this._devices);
+    const devs = Object.keys(this._devices).map((mac) => [mac, this._pickName(mac)]);
+    // devices the rule still names that Protect no longer has: shown so they can be taken out
+    const goneDevs = [...n.devices].filter((mac) => !(mac in this._devices));
     const group = [...n.triggers].map(trigGroup)[0] || "device";
     const noScope = group !== "device";
     const known = new Set([...TABS.flatMap((t) => t[3].flatMap(([, keys]) => keys)), "speed_kmph"]);
@@ -1195,8 +1218,8 @@ class ProtectRulesCard extends HTMLElement {
           <span class="grow"></span><button class="x andx" data-i="${idx}" title="Remove this step"><ha-icon icon="mdi:close"></ha-icon></button></div>
         ${picker(a, idx)}</div>`;
 
-    const ptzCams = Object.keys(this._ptz).map((mac) => [mac, this._devices[mac] || mac]);
-    const sel = (idx, f, opts, cur, empty) => `<select class="wide" data-i="${idx}" data-f="${f}">${opts.length ? "" : `<option value="">${empty}</option>`}${opts.map(([v, l]) => `<option value="${esc(v)}"${String(v) === String(cur) ? " selected" : ""}>${esc(l)}</option>`).join("")}</select>`;
+    const ptzCams = Object.keys(this._ptz).filter((mac) => mac in this._devices).map((mac) => [mac, this._pickName(mac)]);
+    const sel = (idx, f, opts, cur, empty) => `<select class="wide" data-i="${idx}" data-f="${f}">${opts.length ? "" : `<option value="">${empty}</option>`}${(f === "device" && cur && !opts.some(([v]) => v === cur) ? [[cur, this._dev(cur)], ...opts] : opts).map(([v, l]) => `<option value="${esc(v)}"${String(v) === String(cur) ? " selected" : ""}>${esc(l)}</option>`).join("")}</select>`;
     const actionBox = (a, idx) => {
       const head = `<div class="ahead"><div class="pick akind" data-i="${idx}">${a.kind === "keep" ? `<button class="on">${esc(a.label)}</button>` : ""}${[["notify", "Notify", "mdi:bell-outline"], ["webhook", "Webhook", "mdi:webhook"], ["light", "Light", "mdi:lightbulb-on-outline"], ...(ptzCams.length ? [["ptz", "PTZ", "mdi:rotate-3d-variant"]] : [])].map(([k, l, ic]) => chip("", k, l, a.kind === k, ic)).join("")}</div>${n.actions.length > 1 ? `<button class="x" data-i="${idx}" title="Remove this action"><ha-icon icon="mdi:close"></ha-icon></button>` : ""}</div>`;
       let body = "";
@@ -1204,7 +1227,8 @@ class ProtectRulesCard extends HTMLElement {
         body = `<div class="item"><ha-icon icon="mdi:bell-ring-outline"></ha-icon><span class="grow">Push to my phone</span><button class="sw" data-i="${idx}" data-f="push"></button></div>
           <div class="item"><ha-icon icon="mdi:email-outline"></ha-icon><span class="grow">Email me</span><button class="sw" data-i="${idx}" data-f="email"></button></div>`;
       } else if (a.kind === "light") {
-        body = `<label class="f">Turn on the light of</label><select class="wide" data-i="${idx}" data-f="device"><option value="">Pick a device…</option>${devs.map(([mac, name]) => `<option value="${mac}"${mac === a.device ? " selected" : ""}>${esc(name)}</option>`).join("")}</select>
+        body = `<label class="f">Turn on the light of</label><select class="wide" data-i="${idx}" data-f="device"><option value="">Pick a device…</option>${(a.device && !(a.device in this._devices) ? [[a.device, this._dev(a.device)], ...devs] : devs).map(([mac, name]) => `<option value="${esc(mac)}"${mac === a.device ? " selected" : ""}>${esc(name)}</option>`).join("")}</select>
+          ${a.device && !(a.device in this._devices) ? '<div class="k warn" style="margin-top:6px">That device is no longer in Protect. Pick another one.</div>' : ""}
           <label class="f">For</label><select class="wide" data-i="${idx}" data-f="seconds">${[...new Set([10, 30, 60, 120, 300, 600, a.seconds])].sort((x, y) => x - y).map((x) => `<option value="${x}"${x === a.seconds ? " selected" : ""}>${x < 60 ? `${x} seconds` : `${x / 60} min`}</option>`).join("")}</select>`;
       } else if (a.kind === "webhook") {
         body = `<label class="f">Send a request to</label><input class="txt" data-i="${idx}" data-f="url" placeholder="https://…" value="${esc(a.url || "")}">
@@ -1213,6 +1237,7 @@ class ProtectRulesCard extends HTMLElement {
         const lists = this._ptz[a.device] || { presets: [], patrols: [] };
         body = `<div class="pick pmode" data-i="${idx}">${[["preset", "Preset"], ["patrol", "Patrol"], ["autotrack", "Auto-tracking"]].map(([k, l]) => chip("", k, l, a.mode === k)).join("")}</div>
           <label class="f">Camera</label>${sel(idx, "device", ptzCams, a.device, "No PTZ camera")}
+          ${a.device && !(a.device in this._devices) ? '<div class="k warn" style="margin-top:6px">That camera is no longer in Protect. Pick another one, or remove this action.</div>' : ""}
           ${a.mode === "preset" ? `<label class="f">Go to preset</label>${sel(idx, "preset_id", lists.presets.map((x) => [x.id, x.name]), a.preset_id, "No presets saved on this camera")}
             <label class="f">Back home after</label>${sel(idx, "return_home", [...new Set([10, 15, 20, 30, 45, 60, a.return_home])].sort((x, y) => x - y).map((x) => [x, `${x} seconds`]), a.return_home, "")}
             ${lists.presets.length ? "" : '<div class="k" style="margin-top:6px">Save a preset on the camera in Protect first; it shows up here within five minutes.</div>'}` : ""}
@@ -1242,13 +1267,14 @@ class ProtectRulesCard extends HTMLElement {
                const html = chip("", mac, name, n.devices.has(mac));
                const able = n.devices.has(mac) || [...n.triggers].some((t) => this._can(t, mac));
                return able ? html : html.replace("<button ", `<button disabled title="${esc(name)} can't trigger this" `);
-             }).join("")}</div>
+             }).join("")}${goneDevs.map((mac) => chip("", mac, this._dev(mac), true).replace('class="', 'title="No longer in Protect: click to take it out of the rule" class="gone ')).join("")}</div>
+             ${goneDevs.length ? `<div class="k warn" style="margin-top:6px">${goneDevs.length === 1 ? "One device is" : "Some devices are"} no longer in Protect. Click ${goneDevs.length === 1 ? "it" : "them"} to take ${goneDevs.length === 1 ? "it" : "them"} out of the rule.</div>` : ""}
              ${n.scope === "include" ? [...n.devices].map((mac) => {
                const z = this._zones[mac] || {};
                const groups = [["zone", "Zones"], ["line", "Lines"], ["loiter", "Loiter zones"]].filter(([k]) => (z[k] || []).length);
                if (!groups.length) return "";
                const mine = n.zones[mac] || {};
-               return `<div class="zbox"><div class="zname">${esc(this._devices[mac] || mac)}<span class="k"> · none picked = whole view</span></div>${groups.map(([k, label]) => `<label class="f">${label}</label><div class="pick zones" data-mac="${mac}" data-kind="${k}">${z[k].map((x) => `<button data-id="${x.id}" class="${(mine[k] || []).includes(x.id) ? "on" : ""}"><i class="dot" style="background:${esc(x.color || "#888")}"></i>${esc(x.name)}</button>`).join("")}</div>`).join("")}</div>`;
+               return `<div class="zbox"><div class="zname">${esc(this._dev(mac))}<span class="k"> · none picked = whole view</span></div>${groups.map(([k, label]) => `<label class="f">${label}</label><div class="pick zones" data-mac="${mac}" data-kind="${k}">${z[k].map((x) => `<button data-id="${x.id}" class="${(mine[k] || []).includes(x.id) ? "on" : ""}"><i class="dot" style="background:${esc(x.color || "#888")}"></i>${esc(x.name)}</button>`).join("")}</div>`).join("")}</div>`;
              }).join("") : ""}`}</div>
       <div class="box"><h3><ha-icon icon="mdi:play-circle-outline"></ha-icon>Action</h3>
         ${n.actions.map(actionBox).join("")}

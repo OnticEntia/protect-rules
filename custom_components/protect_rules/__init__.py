@@ -37,12 +37,13 @@ from homeassistant.core import HomeAssistant, ServiceCall, callback
 from homeassistant.exceptions import ConfigEntryError, ConfigEntryNotReady, HomeAssistantError
 from homeassistant.helpers import config_validation as cv, device_registry as dr, entity_registry as er
 from homeassistant.helpers.service import async_register_admin_service
+from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.loader import IntegrationNotFound, async_get_integration
 
 from .cards import CardsView, async_card_urls, load_cards, unload_cards
 from .live import RuleFeed
-from .logic import fingerprint, merge_rules, parse_rules
+from .logic import Devices, Outage, fingerprint, merge_rules, parse_rules, rule_devices
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -52,6 +53,8 @@ SCAN_INTERVAL = timedelta(seconds=30)
 ZONES_REFRESH = 300  # seconds
 ZONES_DOMAIN = "protect_zones"  # the companion whose live stream connection is shared
 CARD_URLS = "protect_rules_card_urls"
+DEVICE_STORE = "protect_rules_devices"  # names of devices seen, to name one that is removed later
+DEVICE_GROUPS = ("cameras", "lights", "sensors", "chimes", "doorlocks")
 
 type ProtectRulesConfigEntry = ConfigEntry[RulesCoordinator]
 
@@ -97,6 +100,9 @@ class RulesCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         self._misses: dict[str, int] = {}  # rule -> reads in a row it was missing from
         self._writes = 0  # goes up with every change made here; a read that spans one is stale
         self._locks: dict[str, asyncio.Lock] = {}  # one change at a time per rule
+        self._outage = Outage()  # a console that briefly doesn't answer is ridden out
+        self.devices = Devices()  # what Protect has now, and the names of what it had
+        self._device_store: Store[dict[str, Any]] = Store(hass, 1, DEVICE_STORE)
         self.zones: dict[str, dict[str, list[dict[str, Any]]]] | None = None
         self._zones_at = 0.0
         self.ptz: dict[str, dict[str, Any]] = {}
@@ -111,6 +117,36 @@ class RulesCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
             raise UpdateFailed("UniFi Protect integration isn't loaded")
         return api
 
+    async def async_load_devices(self) -> None:
+        """Bring back the device names remembered before the last restart."""
+        saved = await self._device_store.async_load()
+        names = (saved or {}).get("names")
+        if isinstance(names, dict):
+            self.devices = Devices({k: v for k, v in names.items() if isinstance(k, str) and isinstance(v, str)})
+        self.refresh_devices()
+
+    @callback
+    def refresh_devices(self) -> None:
+        """Look at which devices Protect has right now (from the UniFi
+        Protect integration, which is told of adoptions and removals as they
+        happen). A device that came or went makes the per-camera lists (zones,
+        PTZ presets, what each can detect) be read again at the next poll, so
+        a newly adopted camera is usable without a restart and a removed one
+        drops out of them."""
+        found: list[tuple[str, str, str, bool]] | None = []
+        try:
+            boot = self.api.bootstrap
+            for group in DEVICE_GROUPS:
+                for dev in (getattr(boot, group, None) or {}).values():
+                    found.append((dev.mac, dev.id, dev.display_name, bool(getattr(dev, "is_connected", True))))
+        except Exception:  # noqa: BLE001 - then nothing is called removed
+            found = None
+        changed, learned = self.devices.update(found)
+        if changed:
+            self._zones_at = 0.0
+        if learned:
+            self._device_store.async_delay_save(lambda: {"names": dict(self.devices.remembered)}, 30)
+
     async def _read_rules(self) -> dict[str, dict[str, Any]]:
         """The rule list straight from Protect, checked for shape."""
         rules = await self.api.api_request("automations")
@@ -123,11 +159,23 @@ class RulesCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         writes = self._writes
         try:
             rules = await self._read_rules()
-        except UpdateFailed:
-            raise
         except Exception as err:
-            raise UpdateFailed(f"Couldn't read Protect rules: {err}") from err
+            reason = str(err) if isinstance(err, UpdateFailed) else f"Couldn't read Protect rules: {err}"
+            # The console restarting or a timeout: keep the rules as they
+            # were for a few reads (one warning), and only call it a failure
+            # (entities unavailable, one error from the coordinator) if it lasts.
+            verdict = self._outage.failed(self.data is not None)
+            if verdict == "fail":
+                raise UpdateFailed(reason) from err
+            if verdict == "warn":
+                _LOGGER.warning("Protect isn't answering; keeping the last known rules for now. %s", reason)
+            return self.data
+        if (missed := self._outage.succeeded()) and self.last_update_success:
+            _LOGGER.info("Protect is answering again (after %s missed reads)", missed)
+        self.refresh_devices()
         await self._load_zones()
+        for rule_id in [r for r, lock in self._locks.items() if r not in rules and not lock.locked()]:
+            del self._locks[rule_id]
         if writes != self._writes and self.data is not None:
             # a change was made here while this read was under way: it may
             # show the rules as they were before, so keep what we have
@@ -380,6 +428,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ProtectRulesConfigEntry)
     if _protect_api(hass) is None:
         raise ConfigEntryNotReady("Waiting for the UniFi Protect integration")
     coordinator = RulesCoordinator(hass, entry)
+    await coordinator.async_load_devices()
     await coordinator.async_config_entry_first_refresh()
     entry.runtime_data = coordinator
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
@@ -529,14 +578,9 @@ def _coordinator(hass: HomeAssistant) -> RulesCoordinator | None:
 
 def _payload(hass: HomeAssistant, coordinator: RulesCoordinator) -> dict[str, Any]:
     """The rules as Protect stores them, plus what the card needs to label them."""
-    devices: dict[str, str] = {}
-    try:
-        boot = coordinator.api.bootstrap
-        for group in ("cameras", "lights", "sensors", "chimes", "doorlocks"):
-            for dev in (getattr(boot, group, None) or {}).values():
-                devices[dev.mac] = dev.display_name
-    except Exception:  # noqa: BLE001 - labels only
-        pass
+    coordinator.refresh_devices()
+    known = coordinator.devices
+    rules = coordinator.data or {}
     registry = er.async_get(hass)
     entities = {
         rid: registry.async_get_entity_id("switch", DOMAIN, f"rule_{rid}") for rid in coordinator.data or {}
@@ -549,10 +593,16 @@ def _payload(hass: HomeAssistant, coordinator: RulesCoordinator) -> dict[str, An
         pass
     return {
         "loaded": True,
-        "rules": list((coordinator.data or {}).values()),
+        "rules": list(rules.values()),
         # what each rule looked like, for the edit form to say what it started from
-        "revs": {rid: fingerprint(rule) for rid, rule in (coordinator.data or {}).items()},
-        "devices": devices,
+        "revs": {rid: fingerprint(rule) for rid, rule in rules.items()},
+        # the devices Protect has now (what a rule can be given) ...
+        "devices": dict(known.names),
+        "offline": sorted(known.offline),
+        # ... a name for every device a rule names, also one Protect no longer has ...
+        "labels": {mac: known.label(mac) for rule in rules.values() for mac in rule_devices(rule)},
+        # ... and which of those are gone: {mac: last known name or null}
+        "removed": known.removed_in(rules),
         "zones": coordinator.zones or {},
         "ptz": coordinator.ptz,
         "caps": coordinator.caps,
@@ -699,6 +749,7 @@ def _changes(coordinator: RulesCoordinator, rule: dict[str, Any], msg: dict[str,
         old_sources = rule.get("sources") or []
         scope = msg.get("scope") or (old_sources[0].get("type") if old_sources else "include")
         devices = msg["devices"] if "devices" in msg else [s.get("device") for s in old_sources]
+        _check_devices(coordinator, devices)
         changes["sources"] = _sources(devices, scope, old_sources, msg.get("zones"))
     kinds = [a.get("type") for a in rule.get("actions") or []]
     if "actions" in msg:
@@ -709,6 +760,7 @@ def _changes(coordinator: RulesCoordinator, rule: dict[str, Any], msg: dict[str,
     elif msg.get("action") == "light":
         if "light_device" not in msg:
             raise RuleError("no_device", "Pick the device whose light to turn on")
+        _check_devices(coordinator, [msg["light_device"]])
         changes["actions"] = [_light_action(msg["light_device"], msg.get("light_seconds", 30))]
     elif msg.get("action") == "notify" and "SEND_NOTIFICATION" not in kinds:
         who = _my_receiver(coordinator)
@@ -746,6 +798,11 @@ def _changes(coordinator: RulesCoordinator, rule: dict[str, Any], msg: dict[str,
         cooldown.pop("lastExecutedAt", None)
         changes["cooldown"] = cooldown
     return changes
+
+
+async def async_remove_entry(hass: HomeAssistant, entry: ProtectRulesConfigEntry) -> None:
+    """Protect Rules was removed: forget the device names it kept."""
+    await Store(hass, 1, DEVICE_STORE).async_remove()
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ProtectRulesConfigEntry) -> bool:
@@ -823,6 +880,16 @@ def _also(groups: list[dict[str, Any]], old: list[dict[str, Any]] | None = None)
     ]
 
 
+def _check_devices(coordinator: RulesCoordinator, macs: list[str]) -> None:
+    """Refuse to send Protect a device it no longer has (a rule can still
+    name a camera that was removed; saving it again must not)."""
+    coordinator.refresh_devices()
+    try:
+        coordinator.devices.check(macs)
+    except ValueError as err:
+        raise RuleError("removed_device", str(err)) from err
+
+
 def _sources(
     devices: list[str],
     scope: str,
@@ -874,8 +941,10 @@ def _actions(coordinator: RulesCoordinator, specs: list[dict[str, Any]], old: li
             else:
                 out.append(_notify_action(who, channels))
         elif kind == "light":
+            _check_devices(coordinator, [spec["device"]])
             out.append(_light_action(spec["device"], spec["seconds"]))
         elif kind == "ptz":
+            _check_devices(coordinator, [spec["device"]])
             meta: dict[str, Any] = {"target": spec["device"], "mode": spec["mode"]}
             if spec["mode"] == "preset":
                 if not spec.get("preset_id"):
@@ -974,6 +1043,11 @@ async def ws_create(hass: HomeAssistant, connection, msg) -> None:
         if "light_device" not in msg:
             connection.send_error(msg["id"], "no_device", "Pick the device whose light to turn on")
             return
+        try:
+            _check_devices(coordinator, [msg["light_device"]])
+        except RuleError as err:
+            connection.send_error(msg["id"], err.code, str(err))
+            return
         actions = [_light_action(msg["light_device"], msg["light_seconds"])]
     else:
         connection.send_error(msg["id"], "no_action", "Add at least one action")
@@ -982,6 +1056,11 @@ async def ws_create(hass: HomeAssistant, connection, msg) -> None:
         schedules = _schedule(coordinator, msg["schedule"]) if "schedule" in msg else []
     except HomeAssistantError as err:
         connection.send_error(msg["id"], "bad_schedule", str(err))
+        return
+    try:
+        _check_devices(coordinator, msg["devices"])
+    except RuleError as err:
+        connection.send_error(msg["id"], err.code, str(err))
         return
     rule = {
         "name": msg["name"].strip(),
@@ -1022,19 +1101,15 @@ async def ws_history(hass: HomeAssistant, connection, msg) -> None:
     except Exception as err:  # noqa: BLE001
         connection.send_error(msg["id"], "history_failed", f"Couldn't read the rule's history: {err}")
         return
-    by_id: dict[str, Any] = {}
-    try:
-        boot = coordinator.api.bootstrap
-        for group in ("cameras", "lights", "sensors", "chimes", "doorlocks"):
-            for dev in (getattr(boot, group, None) or {}).values():
-                by_id[dev.id] = dev
-    except Exception:  # noqa: BLE001 - labels only
-        pass
+    coordinator.refresh_devices()
+    devices = coordinator.devices
     out = []
-    for row in rows or []:
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict):
+            continue
         trig = row.get("trigger") or {}
-        dev = by_id.get(trig.get("device"))
-        known = (coordinator.zones or {}).get(dev.mac, {}) if dev else {}
+        # the device a past firing came from may have been removed since
+        known = (coordinator.zones or {}).get(devices.ids.get(trig.get("device")), {})
         zones = []
         for kind, label in (("zone", "Zone"), ("line", "Line"), ("loiter", "Loiter zone"), ("package", "Package zone")):
             for zid in (trig.get("zones") or {}).get(kind) or []:
@@ -1046,7 +1121,7 @@ async def ws_history(hass: HomeAssistant, connection, msg) -> None:
                 "at": row.get("timestamp") or trig.get("timestamp"),
                 "status": row.get("status"),
                 "trigger": trig.get("key"),
-                "device": dev.display_name if dev else None,
+                "device": devices.label_by_id(trig.get("device")),
                 "zones": zones,
                 "event_id": row.get("detectionEventId"),
                 "event_type": src.get("type"),

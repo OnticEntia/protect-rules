@@ -120,8 +120,9 @@ class RuleFeed:
 
     def _describe_trigger(self, row: dict[str, Any]) -> dict[str, Any]:
         trig = row.get("trigger") or {}
-        dev = self._device(trig.get("device"))
-        known = (self.coordinator.zones or {}).get(dev.mac, {}) if dev else {}
+        self.coordinator.refresh_devices()
+        devices = self.coordinator.devices
+        known = (self.coordinator.zones or {}).get(devices.ids.get(trig.get("device")), {})
         zones = []
         for kind in ("zone", "line", "loiter", "package"):
             for zid in (trig.get("zones") or {}).get(kind) or []:
@@ -129,21 +130,10 @@ class RuleFeed:
         src = trig.get("sourceEvent") or {}
         return {
             "trigger": trig.get("key"),
-            "device": dev.display_name if dev else None,
+            "device": devices.label_by_id(trig.get("device")),
             "zones": zones,
             "detection_event_id": row.get("detectionEventId"),
             "detection_type": src.get("type"),
             "score": src.get("score"),
             "status": row.get("status"),
         }
-
-    def _device(self, device_id: str | None):
-        try:
-            boot = self.coordinator.api.bootstrap
-            for group in ("cameras", "lights", "sensors", "chimes", "doorlocks"):
-                dev = (getattr(boot, group, None) or {}).get(device_id)
-                if dev is not None:
-                    return dev
-        except Exception:  # noqa: BLE001 - labels only
-            pass
-        return None
